@@ -3,6 +3,7 @@ from typing import List
 
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
@@ -12,29 +13,44 @@ from torch.utils.data import DataLoader
 
 from dataset.disprot_dataset import DisprotDataset, Sequence, collate_fn
 from dataset.utils import PadRightTo
+from utils import EarlyStopping
 
 
 class Net(nn.Module):
-    def __init__(self, in_size, in_features, out_size):
+    def __init__(self, in_features):
         super().__init__()
 
         def conv_out_len(layer, length_in):
             return (length_in + 2 * layer.padding[0] - layer.dilation[0] * (layer.kernel_size[0] - 1) - 1) // \
                    layer.stride[0] + 1
 
-        self.conv1 = nn.Conv1d(in_features, 50, kernel_size=21, stride=1, padding=10)
-        self.conv2 = nn.Conv1d(self.conv1.out_channels, 30, kernel_size=11, stride=1, padding=5)
-        self.conv3 = nn.Conv1d(self.conv2.out_channels, 20, kernel_size=7, stride=1, padding=3)
-        self.conv4 = nn.Conv1d(self.conv3.out_channels, 1, kernel_size=1, stride=1, padding=0)
+        channels = [in_features, 70, 60, 50, 30, 20, 10, 5, 3, 1]
+        kernel_sizes = [81, 51, 41, 31, 21, 11, 7, 5, 1]
+        paddings = [int((k_size - 1) / 2) for k_size in kernel_sizes]
+
+        assert len(channels) - 1 == len(kernel_sizes) == len(paddings)
+
+        self.conv_layers = nn.ModuleList([
+                nn.Conv1d(channels[i], c_size, kernel_size=k_size, padding=p_size) for i, (k_size, c_size, p_size) in
+                enumerate(zip(kernel_sizes, channels[1:], paddings))
+        ])
+
+        # Every 2 convolution layers, we add a batch normalization layer
+        self.bn_layers = {l: nn.BatchNorm1d(l.out_channels) for l in self.conv_layers[1::2] if l.out_channels != 1}
 
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.relu(self.conv3(x))
-        x = self.sigmoid(self.conv4(x))
+        # Cycle through convolution layers except last one, that has to be used with a different activation function
+        for i, layer in enumerate(self.conv_layers[:-1]):
+            # Add batch normalization layer every 2 convolution layers, except last one
+            if layer in self.bn_layers:
+                x = self.relu(self.bn_layers[layer](layer(x)))
+            else:
+                x = self.relu(layer(x))
+        # Last convolution layer with the sigmoid activation function
+        x = self.sigmoid(self.conv_layers[-1](x))
         x = x.flatten(start_dim=1)
         return x
 
@@ -58,26 +74,29 @@ def batch_auc(sequences: List[Sequence], pred):
 
 def plot_auc_and_loss(train_losses, test_losses, test_aucs, epoch, title="AUC and Loss"):
     plt.close('all')
-    fig, ax1 = plt.subplots(figsize=(8.5, 7.5))
+    hundred_epochs = int((epoch + 2) / 100)
+    x_size = 8.5 + hundred_epochs * 2.5
+    fig, ax1 = plt.subplots(figsize=(x_size, 7.5))
 
     x_test = np.arange(1, epoch + 2)
-    train_losses = train_losses.reshape(-1, 4).mean(axis=1)
+    # train_losses = train_losses.reshape(-1, 4).mean(axis=1)
     x_train = np.linspace(0, epoch + 1, len(train_losses))
 
-    ax1.plot(x_train, train_losses, color='slategrey', linewidth=1, label='Train Loss')
-    ax1.plot(x_test, test_losses, color='dodgerblue', marker='o', linewidth=2, label='Test Loss')
-    max_ticks = 22
-    ax1.set_xticks(np.linspace(0, epoch + 2, max_ticks, dtype=int))
+    ax1.plot(x_train, train_losses, color='slategrey', linewidth=1, marker='o', markersize=2, label='Train Loss')
+    ax1.plot(x_test, test_losses, color='dodgerblue', linewidth=1, marker='o', markersize=2, label='Test Loss')
+    max_ticks = 22 * hundred_epochs if hundred_epochs > 0 else 22
+    ax1.set_xticks(np.linspace(0, epoch + 1, max_ticks, dtype=int))
+    plt.xticks(rotation=90)
     ax1.tick_params(axis='y', color='slategrey', labelcolor='slategrey')
-    ax1.set_ylabel('Loss')
-    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss (MSE)', color='slategrey')
+    ax1.set_xlabel('Time (epochs)')
     ax1.set_yscale('log')
 
     ax2 = ax1.twinx()
-    ax2.plot(x_test, test_aucs, color='orange', marker='o', linewidth=2, label='Test AUC')
+    ax2.plot(x_test, test_aucs, color='orange', linewidth=1, marker='o', markersize=2, label='Test AUC')
     ax2.tick_params(axis='y', color='orange', labelcolor='orange')
     ax2.set_yticks(np.linspace(0, 1, 11))
-    ax2.set_ylabel('AUC')
+    ax2.set_ylabel('AUC', color='orange')
     # Set the minimum y-axis value to 0.0 and maximum y-axis value to 1.0 (AUC is between 0.0 and 1.0)
     ax2.set_ylim(0.0, 1.0)
     ax2.grid(True, which='major', axis='y', linestyle='dotted')
@@ -145,8 +164,8 @@ def train(model, train_loader, optimizer, criterion, device, epoch):
         optimizer.zero_grad(set_to_none=True)
         running_loss += loss.item() * data.size(0)
         losses = np.append(losses, [loss.item()])
-        if batch_idx % 10 == 0:
-            print('Train Epoch: {} [{:4d}/{} ({:2.0f}%)] Loss: {:.3f}'.format(
+        if batch_idx == len(train_loader) - 1:
+            print('\nTrain Epoch: {} [{:4d}/{} ({:2.0f}%)] Loss: {:.3f}'.format(
                     epoch + 1, batch_idx * len(data), len(train_loader.dataset),
                     100. * batch_idx / len(train_loader), loss.item()))
 
@@ -166,7 +185,7 @@ def test(model, test_loader, criterion, device):
             test_auc += batch_auc(sequences, output) * data.size(0)
     test_loss /= len(test_loader)
     test_auc /= len(test_loader.dataset)
-    print('\nTest set: Average loss: {:.4f}, AUC: {:.4f}\n'.format(test_loss, test_auc))
+    print('Test set: Average loss: {:.4f}, AUC: {:.4f}'.format(test_loss, test_auc))
     return test_loss, test_auc
 
 
@@ -178,10 +197,33 @@ def predict_one_sequence(model, sequence: Sequence, device):
     return output
 
 
+def caid_format(idx=0):
+    sequence: Sequence = test_disorder[idx]
+    prediction = predict_one_sequence(net, sequence, device)
+    for idx, (aa, pred) in enumerate(zip(sequence.sequence, prediction)):
+        print(f'{idx + 1:3d}\t{aa}\t{pred:.3f}')
+
+
+def pred_heatmap(idx=0):
+    sequence: Sequence = test_disorder[idx]
+    prediction = predict_one_sequence(net, sequence, device)
+    x = np.vstack((sequence.clean_target, prediction))
+    fig, ax = plt.subplots(figsize=(12, 4))
+    cmap = sns.light_palette("seagreen", as_cmap=True)
+    sns.heatmap(x, vmin=0, vmax=1, cmap=cmap)
+    ax.set_yticklabels(["Truth", "Prediction"])
+    plt.show()
+
+
 if __name__ == '__main__':
     use_pssm = True
-    n_features = 21 if use_pssm else 1
-    train_epochs = 100
+    use_spd3 = True
+
+    pca = True
+
+    n_features = 1 + (4 if pca else 20 * use_pssm) + (5 if pca else 12 * use_spd3)
+    train_epochs = 1000
+    early_stopping = True
 
     # Performance tuning
     torch.multiprocessing.set_sharing_strategy('file_system')
@@ -194,43 +236,59 @@ if __name__ == '__main__':
     # Load the data
     train_data = pd.read_json(os.path.join("data/dataset/disorder_train.json"), orient='records', dtype=False)
     test_data = pd.read_json(os.path.join("data/dataset/disorder_test.json"), orient='records', dtype=False)
+
+    pad = PadRightTo(4000)
+
     # Defining the dataset
     train_disorder = DisprotDataset(data=train_data, feature_root='data/features',
-                                    pssm=use_pssm, transform=PadRightTo(4000), target_transform=PadRightTo(4000))
-    test_disorder = DisprotDataset(data=test_data, feature_root='data/features',
-                                   pssm=use_pssm, transform=PadRightTo(4000), target_transform=PadRightTo(4000))
+                                    pssm=use_pssm, spd3=use_spd3, transform=pad, target_transform=pad)
+    test_disorder = DisprotDataset(data=test_data, spd3=use_spd3, feature_root='data/features',
+                                   pssm=use_pssm, transform=pad, target_transform=pad)
+
     # Defining the dataloader for the training set and the test set
-    train_loader = DataLoader(train_disorder, batch_size=50, shuffle=True, num_workers=8, collate_fn=collate_fn,
+    train_loader = DataLoader(train_disorder, batch_size=20, shuffle=True, num_workers=8, collate_fn=collate_fn,
                               pin_memory=True)
-    test_loader = DataLoader(test_disorder, batch_size=50, shuffle=True, num_workers=8, collate_fn=collate_fn,
+    test_loader = DataLoader(test_disorder, batch_size=340, shuffle=True, num_workers=8, collate_fn=collate_fn,
                              pin_memory=True)
 
+    net = Net(in_features=n_features)
     # Instantiate the model
-    net = Net(in_size=4000, in_features=n_features, out_size=4000).to(device)
-    # net = nn.DataParallel(net).to(device)
+    if torch.cuda.device_count() > 1:
+        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        net = nn.DataParallel(net).to(device)
 
     # Define the loss function and the optimizer
     criterion = nn.MSELoss(reduction='mean')
 
-    # optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
-    optimizer = optim.Adam(net.parameters(), lr=0.000005)
+    # optimizer = optim.SGD(net.parameters(), lr=1e-6, momentum=0.9)
+    optimizer = optim.Adam(net.parameters(), lr=5e-6)
+
+    # Early stopping
+    early_stop = EarlyStopping(patience=15, delta=1e-4, save_model=True, path='./models/checkpoint.pt',
+                               more_is_better=False)
 
     all_train_loss, all_test_loss, all_test_aucs = np.array([]), np.array([]), np.array([])
     for epoch in range(train_epochs):
-        _, losses = train(net, train_loader, optimizer, criterion, device, epoch)
-        all_train_loss = np.concatenate((all_train_loss, losses))
+        epoch_mean_loss, losses = train(net, train_loader, optimizer, criterion, device, epoch)
+        all_train_loss = np.append(all_train_loss, epoch_mean_loss)
 
         test_loss, test_auc = test(net, test_loader, criterion, device)
         all_test_loss = np.append(all_test_loss, [test_loss])
         all_test_aucs = np.append(all_test_aucs, [test_auc])
 
-        if epoch % 10 == 0:
+        if early_stopping and early_stop(test_loss, net, optimizer, epoch):
+            # Print with red color to indicate that the training has stopped
+            print('\033[91m' + f'Training stopped early at epoch {epoch}' + '\033[0m')
+            break
+
+        if (epoch + 1) % 50 == 0:
             plot_auc_and_loss(all_train_loss, all_test_loss, all_test_aucs, epoch)
 
-    plot_roc_curve(net, test_loader, device)
-    plot_roc_curve(net, train_loader, device, set='Train')
+    plot_auc_and_loss(all_train_loss, all_test_loss, all_test_aucs, epoch)
 
-    sequence: Sequence = test_disorder[0]
-    prediction = predict_one_sequence(net, sequence, device)
-    for idx, (aa, pred) in enumerate(zip(sequence.sequence, prediction)):
-        print(f'{idx + 1:3d}\t{aa}\t{pred:.3f}')
+    # Load the best model
+    checkpoint = torch.load('./models/checkpoint.pt')
+    net.load_state_dict(checkpoint['model_state_dict'])
+
+    plot_roc_curve(net, train_loader, device, set='Train')
+    plot_roc_curve(net, test_loader, device)
