@@ -5,7 +5,6 @@ from typing import List
 import torch
 from joblib import load
 from torch.utils.data import Dataset
-from tqdm import tqdm
 
 from dataset.encoding import Uniprot21
 from dataset.utils import parse_target, read_pssm, read_spd3
@@ -13,17 +12,16 @@ from dataset.utils import parse_target, read_pssm, read_spd3
 
 class Sequence:
     def __init__(self, seq_id, sequence, target=None, load_pssm=False, load_spd3=False, features_path=None,
-                 data_transform=None, target_transform=None, pssm_pca=None, spd3_pca=None):
+                 data_transform=None, target_transform=None, pssm_pca=None, spd3_pca=None, pca=False):
         self.seq_id = seq_id
         self.sequence = sequence
         self.encoded_sequence = torch.tensor(Uniprot21().encode(sequence), dtype=torch.uint8).reshape(1, -1)
+        self._target = None
         if target is not None:
             self._target = parse_target(target)
 
         self.data_transform = data_transform
         self.target_transform = target_transform
-
-        pca = True
 
         self.pssm, self.spd3 = None, None
         if load_pssm and features_path is not None:
@@ -61,6 +59,8 @@ class Sequence:
 
     @property
     def clean_target(self):
+        if self._target is None:
+            return self._target
         return self._target.numpy()
 
     def __len__(self):
@@ -82,7 +82,7 @@ class Sequence:
 # Base class for the two datasets, with common functionality
 class DisprotDataset(Dataset):
     def __init__(self, data, feature_root='../data/features', transform=None, target_transform=None, pssm=False,
-                 spd3=False):
+                 spd3=False, pca=False):
         # Define the encoder fot the sequence
         self.encoder = Uniprot21()
 
@@ -98,13 +98,12 @@ class DisprotDataset(Dataset):
 
         # Create sequences objects
         self.data = []
-        for seq_id, sequence, target in tqdm(self.raw_data.itertuples(index=False), desc=f'Importing sequences',
-                                             total=len(self.raw_data)):
+        for seq_id, sequence, target in self.raw_data.itertuples(index=False):
             # Split the sequence with a moving window of size 20, add padding at the end
             self.data.append(
-                Sequence(seq_id, sequence, target, load_pssm=pssm, load_spd3=spd3, features_path=feature_root,
-                         data_transform=self.transform, target_transform=self.target_transform,
-                         pssm_pca=pssm_pca, spd3_pca=spd3_pca))
+                    Sequence(seq_id, sequence, target, load_pssm=pssm, load_spd3=spd3, features_path=feature_root,
+                             data_transform=self.transform, target_transform=self.target_transform,
+                             pssm_pca=pssm_pca, spd3_pca=spd3_pca, pca=pca))
 
     def __len__(self):
         return len(self.data)
